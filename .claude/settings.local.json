@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -version)",
+      "Bash(py --version)",
+      "Bash(python3.11 --version)",
+      "Bash(where python *)",
+      "Bash(python *)",
+      "Bash(start loan_dashboard_page1.png)",
+      "Bash(start loan_dashboard_page2.png)",
+      "Bash(pip install *)",
+      "Bash(pip list *)",
+      "Bash(python3.11 -m pip install --upgrade numpy)",
+      "Bash(py -3.11 -m pip install --upgrade numpy)",
+      "Bash(py *)",
+      "Read(//mnt/c/Users/yashk/Downloads/**)",
+      "Read(//mnt/c/Users/yashk/Downloads/Loan/**)",
+      "Bash(cmd.exe *)",
+      "Bash(python3 -c \"import os; files = os.listdir\\('.'\\); print\\('\\\\n'.join\\(files\\)\\)\")",
+      "Bash(python3 *)"
+    ]
+  }
+}

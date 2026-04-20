@@ -1,0 +1,14 @@
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+
+# Manual payments data (personal)
+manual_payments.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Outputs
+*.png

@@ -1,8 +1,9 @@
 # Streamlit secrets — never commit
 .streamlit/secrets.toml
 
-# Manual payments data (personal)
+# Personal data
 manual_payments.json
+Loan analyzer.csv
 
 # Python
 __pycache__/

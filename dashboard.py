@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 import streamlit as st
 
 warnings.filterwarnings("ignore")
@@ -438,163 +439,956 @@ if "manual_version" not in st.session_state:
     st.session_state.manual_version = 0
 if "default_emi" not in st.session_state:
     st.session_state.default_emi = 20_000
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "🏦 Loan Dashboard"
+
+TODAY         = date.today()
+today_str     = TODAY.strftime("%Y-%m-%d")
+_on_loan_page = (st.session_state.get("current_page", "🏦 Loan Dashboard") == "🏦 Loan Dashboard")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LOAD & COMPUTE
+#  LOAD & COMPUTE  (only when on loan page)
 # ─────────────────────────────────────────────────────────────────────────────
-TODAY     = date.today()
-today_str = TODAY.strftime("%Y-%m-%d")
-mv        = st.session_state.manual_version
+if _on_loan_page:
+    mv      = st.session_state.manual_version
+    raw_df  = load_data(manual_version=mv)
+    df_json = raw_df.to_json(orient="records", date_format="iso")
+    m       = compute_metrics(df_json, today_str, manual_version=mv)
 
-raw_df  = load_data(manual_version=mv)
-df_json = raw_df.to_json(orient="records", date_format="iso")
-m       = compute_metrics(df_json, today_str, manual_version=mv)
+    def _dt(df, col="Date"):
+        df[col] = pd.to_datetime(df[col], utc=True).dt.tz_localize(None)
+        return df
 
-def _dt(df, col="Date"):
-    df[col] = pd.to_datetime(df[col], utc=True).dt.tz_localize(None)
+    disb              = _dt(pd.DataFrame(m["disb"]))
+    ints_df           = _dt(pd.DataFrame(m["ints"]))
+    pmts_df           = _dt(pd.DataFrame(m["pmts"]))
+    ipmts_df          = _dt(pd.DataFrame(m["ipmts"]))
+    ints_s            = _dt(pd.DataFrame(m["ints_s"]))
+    pmts_s            = _dt(pd.DataFrame(m["pmts_s"]))
+    bal_ts            = _dt(pd.DataFrame(m["bal_ts"]))
+    mon_int           = pd.DataFrame(m["mon_int"]); mon_int["Dt"] = pd.to_datetime(mon_int["Dt"])
+    mon_pmt           = pd.DataFrame(m["mon_pmt"]); mon_pmt["Dt"] = pd.to_datetime(mon_pmt["Dt"])
+
+    total_disbursed   = m["total_disbursed"]
+    total_int_charged = m["total_int_charged"]
+    total_repaid      = m["total_repaid"]
+    outstanding       = m["outstanding"]
+    principal_repaid  = m["principal_repaid"]
+    loan_start        = pd.Timestamp(m["loan_start"])
+    loan_age_days     = m["loan_age_days"]
+    loan_age_months   = m["loan_age_months"]
+    n_ints            = m["n_ints"]
+
+    bal_ts_json  = bal_ts.to_json(orient="records", date_format="iso")
+    ints_s_json  = ints_s[["Date", "Remarks", "Abs"]].to_json(orient="records", date_format="iso")
+
+    theory           = calc_theory(bal_ts_json, today_str)
+    rate_df          = calc_implied_rates(ints_s_json, bal_ts_json)
+    theory_total_int = theory["CumInt"].iloc[-1]
+
+    disb_meta = []
+    for i in range(len(disb)):
+        row = disb.iloc[i]
+        dt  = row["Date"].date()
+        amt = row["Abs"]
+        de  = (TODAY - dt).days
+        disb_meta.append(dict(
+            n=i+1, tag=row["Date"].strftime("%b'%y"),
+            dt=dt, amt=amt, col=TRANCHE_COLS[i % 4],
+            days=de, theory_int=amt * RATE_PA / 365 * de,
+        ))
+
+    breakeven = outstanding * RATE_PA / 12
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MUTUAL FUNDS — UTILITY FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+_MF_KNOWN_AMCS = [
+    "Aditya Birla Sun Life", "Axis", "Bandhan", "Bank of India",
+    "Baroda BNP Paribas", "Canara Robeco", "DSP", "Edelweiss",
+    "Franklin Templeton", "HDFC", "HSBC", "ICICI Prudential",
+    "IDBI", "IDFC", "IL&FS", "Invesco India", "ITI",
+    "JM Financial", "Kotak Mahindra", "LIC", "Mahindra Manulife",
+    "Mirae Asset", "Motilal Oswal", "Navi", "Nippon India",
+    "NJ", "PGIM India", "PPFAS", "Quant", "Quantum",
+    "SBI", "Shriram", "Sundaram", "Tata", "Taurus",
+    "Trust", "Union", "UTI", "WhiteOak Capital", "Zerodha",
+]
+
+def _mf_extract_amc(name: str) -> str:
+    for amc in sorted(_MF_KNOWN_AMCS, key=len, reverse=True):
+        if name.lower().startswith(amc.lower()):
+            return amc
+    parts = name.split()
+    return " ".join(parts[:min(2, len(parts))])
+
+def _mf_cagr(start_val: float, end_val: float, years: float) -> float:
+    if years <= 0 or start_val <= 0 or end_val <= 0:
+        return 0.0
+    return ((end_val / start_val) ** (1.0 / years) - 1) * 100
+
+def _mf_card(label: str, value: str, sub: str, color: str) -> str:
+    return (
+        f'<div class="metric-card" style="border-left-color:{color}">'
+        f'<div class="metric-label">{label}</div>'
+        f'<div class="metric-value" style="color:{color}">{value}</div>'
+        f'<div class="metric-sub">{sub}</div>'
+        f'</div>'
+    )
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mf_fetch_list() -> list:
+    r = requests.get("https://api.mfapi.in/mf", timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _mf_fetch_nav(code: int) -> tuple:
+    r = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    meta = data.get("meta", {})
+    df   = pd.DataFrame(data.get("data", []))
+    if df.empty:
+        return meta, pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
+    df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
+    df = df.dropna(subset=["nav"]).sort_values("date").reset_index(drop=True)
+    return meta, df
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mf_build_df(raw_json: str) -> pd.DataFrame:
+    fund_list = json.loads(raw_json)
+    df = pd.DataFrame(fund_list)
+    df = df.rename(columns={"schemeCode": "code", "schemeName": "name"})
+    # Keep only active funds (have a live ISIN) and deduplicate by scheme code
+    if "isinGrowth" in df.columns:
+        df = df[df["isinGrowth"].notna()]
+    df = df.drop_duplicates(subset=["code"])
+    df = df[["code", "name"]].dropna(subset=["name"])
+    df["name"] = df["name"].astype(str)
+    df["amc"] = df["name"].apply(_mf_extract_amc)
     return df
 
-disb              = _dt(pd.DataFrame(m["disb"]))
-ints_df           = _dt(pd.DataFrame(m["ints"]))
-pmts_df           = _dt(pd.DataFrame(m["pmts"]))
-ipmts_df          = _dt(pd.DataFrame(m["ipmts"]))
-ints_s            = _dt(pd.DataFrame(m["ints_s"]))
-pmts_s            = _dt(pd.DataFrame(m["pmts_s"]))
-bal_ts            = _dt(pd.DataFrame(m["bal_ts"]))
-mon_int           = pd.DataFrame(m["mon_int"]); mon_int["Dt"] = pd.to_datetime(mon_int["Dt"])
-mon_pmt           = pd.DataFrame(m["mon_pmt"]); mon_pmt["Dt"] = pd.to_datetime(mon_pmt["Dt"])
+def _mf_nav_at(navs: pd.DataFrame, target: date):
+    ts  = pd.Timestamp(target)
+    fwd = navs[navs["date"] >= ts]
+    if not fwd.empty:
+        return fwd.iloc[0]
+    bwd = navs[navs["date"] < ts]
+    return bwd.iloc[-1] if not bwd.empty else None
 
-total_disbursed   = m["total_disbursed"]
-total_int_charged = m["total_int_charged"]
-total_repaid      = m["total_repaid"]
-outstanding       = m["outstanding"]
-principal_repaid  = m["principal_repaid"]
-loan_start        = pd.Timestamp(m["loan_start"])
-loan_age_days     = m["loan_age_days"]
-loan_age_months   = m["loan_age_months"]
-n_ints            = m["n_ints"]
+def _mf_lumpsum(navs: pd.DataFrame, start: date, amount: float) -> dict | None:
+    row0 = _mf_nav_at(navs, start)
+    if row0 is None:
+        return None
+    start_nav = row0["nav"]
+    start_dt  = row0["date"]
+    units     = amount / start_nav
+    period    = navs[navs["date"] >= start_dt].copy()
+    period["portfolio_value"] = units * period["nav"]
+    period["invested"]        = amount
+    period["gain"]            = period["portfolio_value"] - amount
+    end_val = period["portfolio_value"].iloc[-1]
+    end_dt  = period["date"].iloc[-1]
+    years   = max((end_dt - start_dt).days / 365.25, 0.001)
+    return dict(
+        inv_type="Lumpsum", invested=amount, units=units,
+        start_nav=start_nav, end_nav=navs["nav"].iloc[-1],
+        end_value=end_val, abs_return=end_val - amount,
+        abs_pct=(end_val - amount) / amount * 100,
+        cagr=_mf_cagr(amount, end_val, years),
+        years=years, period_df=period,
+        start_date=start_dt.date(), end_date=end_dt.date(),
+    )
 
-bal_ts_json  = bal_ts.to_json(orient="records", date_format="iso")
-ints_s_json  = ints_s[["Date", "Remarks", "Abs"]].to_json(orient="records", date_format="iso")
+def _mf_sip(navs: pd.DataFrame, start: date, monthly: float,
+            end: date | None = None, stepup_pct: float = 0.0) -> dict | None:
+    if end is None:
+        end = navs["date"].iloc[-1].date()
+    rows, total_units, total_invested = [], 0.0, 0.0
+    sip_amt = monthly
+    cur     = date(start.year, start.month, 1)
+    while cur <= end:
+        row = _mf_nav_at(navs, cur)
+        if row is not None:
+            nav   = row["nav"]
+            units = sip_amt / nav
+            total_units    += units
+            total_invested += sip_amt
+            rows.append(dict(date=row["date"], nav=nav, units_bought=units,
+                             cum_units=total_units, cum_invested=total_invested,
+                             sip_amount=sip_amt))
+        nxt = date(cur.year + 1, 1, 1) if cur.month == 12 else date(cur.year, cur.month + 1, 1)
+        if stepup_pct > 0 and nxt.month == 1 and nxt != date(start.year, 1, 1):
+            sip_amt *= (1 + stepup_pct / 100)
+        cur = nxt
+    if not rows:
+        return None
+    sip_df  = pd.DataFrame(rows)
+    full    = navs[navs["date"] >= sip_df["date"].min()].copy().reset_index(drop=True)
+    cum_u, cum_i = [], []
+    for d in full["date"]:
+        prior = sip_df[sip_df["date"] <= d]
+        cum_u.append(prior["cum_units"].iloc[-1] if not prior.empty else 0.0)
+        cum_i.append(prior["cum_invested"].iloc[-1] if not prior.empty else 0.0)
+    full["cum_units"]       = cum_u
+    full["cum_invested"]    = cum_i
+    full["portfolio_value"] = full["cum_units"] * full["nav"]
+    full["gain"]            = full["portfolio_value"] - full["cum_invested"]
+    end_val = total_units * navs["nav"].iloc[-1]
+    abs_ret = end_val - total_invested
+    years   = max((sip_df["date"].iloc[-1] - sip_df["date"].iloc[0]).days / 365.25, 0.001)
+    approx_cagr = _mf_cagr(total_invested / 2, end_val, years / 2) if years > 0.5 else 0.0
+    return dict(
+        inv_type="SIP", monthly=monthly, installments=len(sip_df),
+        invested=total_invested, units=total_units,
+        end_value=end_val, abs_return=abs_ret,
+        abs_pct=abs_ret / total_invested * 100 if total_invested else 0,
+        cagr_approx=approx_cagr, years=years,
+        sip_df=sip_df, full_period=full,
+        start_date=sip_df["date"].iloc[0].date(),
+        end_date=sip_df["date"].iloc[-1].date(),
+    )
 
-theory           = calc_theory(bal_ts_json, today_str)
-rate_df          = calc_implied_rates(ints_s_json, bal_ts_json)
-theory_total_int = theory["CumInt"].iloc[-1]
+def _mf_hist_returns(navs: pd.DataFrame) -> dict:
+    if navs.empty:
+        return {}
+    latest_nav  = navs["nav"].iloc[-1]
+    latest_date = navs["date"].iloc[-1]
+    out = {}
+    for yrs in [1, 2, 3, 5, 7, 10]:
+        target = latest_date - pd.DateOffset(years=yrs)
+        past   = navs[navs["date"] <= target]
+        if not past.empty:
+            out[f"{yrs}yr"] = round(_mf_cagr(past["nav"].iloc[-1], latest_nav, yrs), 2)
+    return out
 
-disb_meta = []
-for i in range(len(disb)):
-    row = disb.iloc[i]
-    dt  = row["Date"].date()
-    amt = row["Abs"]
-    de  = (TODAY - dt).days
-    disb_meta.append(dict(
-        n=i+1, tag=row["Date"].strftime("%b'%y"),
-        dt=dt, amt=amt, col=TRANCHE_COLS[i % 4],
-        days=de, theory_int=amt * RATE_PA / 365 * de,
-    ))
+def _mf_project_future(amount: float, inv_type: str, rate_pct: float,
+                       years: int, stepup_pct: float = 0.0) -> pd.DataFrame:
+    rate_m = rate_pct / 100 / 12
+    rows   = []
+    if inv_type == "Lumpsum":
+        for mo in range(years * 12 + 1):
+            rows.append(dict(month=mo, year=mo / 12, invested=amount,
+                             value=amount * (1 + rate_pct / 100) ** (mo / 12)))
+    else:
+        val, invested, sip = 0.0, 0.0, amount
+        rows.append(dict(month=0, year=0, invested=0, value=0))
+        for mo in range(1, years * 12 + 1):
+            val      = (val + sip) * (1 + rate_m)
+            invested += sip
+            rows.append(dict(month=mo, year=mo / 12, invested=invested, value=val))
+            if mo % 12 == 0 and stepup_pct > 0:
+                sip *= (1 + stepup_pct / 100)
+    df = pd.DataFrame(rows)
+    df["gain"]     = df["value"] - df["invested"]
+    df["gain_pct"] = df["gain"] / df["invested"].replace(0, np.nan) * 100
+    return df
 
-breakeven = outstanding * RATE_PA / 12
+# ─────────────────────────────────────────────────────────────────────────────
+#  MUTUAL FUNDS — FULL PAGE RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+def render_mf_page():
+    MFC = dict(
+        navy="#1A2E4A", blue="#1B5299", gold="#C8912A",
+        green="#27AE60", red="#C0392B", orange="#E67E22",
+        purple="#8E44AD", teal="#16A085", gray="#7F8C8D",
+    )
+
+    # ── Load fund list ─────────────────────────────────────────────────────────
+    with st.spinner("Loading active funds from mfapi.in…"):
+        try:
+            raw_funds = _mf_fetch_list()
+            fund_df   = _mf_build_df(json.dumps(raw_funds))
+        except Exception as e:
+            st.error(f"mfapi.in unreachable: {e}")
+            return
+
+    # ── Sidebar controls ────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown(f"**{len(fund_df):,} funds loaded**")
+        st.markdown("### 🔍 Find a Fund")
+
+        search_mode = st.radio("Search by", ["AMC → Fund Name", "Direct Search"],
+                               horizontal=True, key="mf_search_mode")
+
+        selected_code, selected_name = None, None
+
+        if search_mode == "AMC → Fund Name":
+            amc_list   = ["— Select AMC —"] + sorted(fund_df["amc"].unique())
+            chosen_amc = st.selectbox("Fund House / AMC", amc_list, key="mf_amc")
+            if chosen_amc != "— Select AMC —":
+                sub   = fund_df[fund_df["amc"] == chosen_amc].reset_index(drop=True)
+                names = sub["name"].tolist()
+                codes = sub["code"].tolist()
+                fidx  = st.selectbox("Fund Name", range(len(names)),
+                                     format_func=lambda i: names[i], key="mf_fund_idx")
+                selected_code = int(codes[fidx])
+                selected_name = names[fidx]
+        else:
+            term = st.text_input("Search fund name", key="mf_search_term",
+                                 placeholder="e.g. HDFC Flexi Cap Growth")
+            if term:
+                hits = fund_df[fund_df["name"].str.contains(term, case=False, na=False)].reset_index(drop=True)
+                if hits.empty:
+                    st.warning("No matching funds found.")
+                else:
+                    names = hits["name"].tolist()
+                    codes = hits["code"].tolist()
+                    fidx  = st.selectbox("Select fund", range(len(names)),
+                                         format_func=lambda i: names[i], key="mf_search_idx")
+                    selected_code = int(codes[fidx])
+                    selected_name = names[fidx]
+
+        if selected_code:
+            st.divider()
+            st.markdown("### 🗂️ Mode")
+            mf_mode = st.radio(
+                "Choose mode",
+                ["📅 Historical Backtest", "🔮 Future Projection"],
+                key="mf_mode",
+                help="Historical: real NAV data  |  Future: project with chosen rate",
+            )
+            st.divider()
+            st.markdown("### 💰 Investment")
+            mf_inv_type = st.radio("Type", ["Lumpsum", "SIP (Monthly)"],
+                                   horizontal=True, key="mf_inv_type")
+            if mf_inv_type == "Lumpsum":
+                mf_amount = st.number_input("Amount (₹)", min_value=1_000,
+                                            max_value=100_000_000, value=1_00_000,
+                                            step=1_000, format="%d", key="mf_lumpsum")
+                mf_stepup = 0.0
+            else:
+                mf_amount = st.number_input("Monthly SIP (₹)", min_value=500,
+                                            max_value=10_000_000, value=5_000,
+                                            step=500, format="%d", key="mf_sip_amt")
+                mf_stepup = float(st.slider("Annual Step-up %", 0, 30, 0, key="mf_stepup"))
+            st.divider()
+            if "Historical" in mf_mode:
+                st.markdown("### 📅 Period")
+                mf_start = st.date_input(
+                    "Invest from", key="mf_start_date",
+                    value=date(TODAY.year - 5, TODAY.month, 1),
+                    min_value=date(1995, 1, 1),
+                    max_value=TODAY - timedelta(days=30),
+                )
+                if mf_inv_type == "SIP (Monthly)":
+                    mf_end = st.date_input("SIP end date", key="mf_end_date",
+                                           value=TODAY,
+                                           min_value=mf_start + timedelta(days=30),
+                                           max_value=TODAY)
+                else:
+                    mf_end = TODAY
+            else:
+                st.markdown("### 🔮 Projection")
+                mf_proj_years = st.slider("Horizon (years)", 1, 40, 10, key="mf_years")
+                mf_inflation  = st.slider("Inflation %", 0, 15, 6, key="mf_inflation")
+
+    # ── Main content area ───────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#1A2E4A 0%,#1B5299 100%);
+         padding:16px 24px;border-radius:12px;margin-bottom:14px;
+         border-bottom:3px solid #C8912A;">
+      <h2 style="color:white;margin:0;font-size:20px;letter-spacing:0.5px;">
+        📊 MUTUAL FUNDS INVESTMENT DASHBOARD
+      </h2>
+      <p style="color:#C8912A;margin:3px 0 0;font-size:11px;letter-spacing:0.3px;">
+        Powered by mfapi.in &nbsp;|&nbsp; Real NAV · Historical Backtesting · Future Projection
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not selected_code:
+        st.markdown("""
+        <div style="background:#EBF5FB;border-left:4px solid #1B5299;border-radius:6px;
+             padding:12px 16px;font-size:11px;color:#1A2E4A;margin-bottom:12px;">
+        <b>How to use:</b> Search for a mutual fund using the sidebar (by AMC or by name).
+        Then choose <b>Historical Backtest</b> to simulate past returns with real NAV data,
+        or <b>Future Projection</b> to estimate growth over a chosen horizon.
+        Toggle between <b>Lumpsum</b> and <b>SIP</b> investment modes.
+        </div>
+        """, unsafe_allow_html=True)
+
+        pop = {
+            "HDFC Flexi Cap Fund": 101762,
+            "Axis Large Cap Fund": 112277,
+            "Mirae Asset Large & Midcap Fund": 112932,
+            "PPFAS Flexi Cap Fund": 122640,
+            "SBI Small Cap Fund": 125494,
+            "Nippon India Small Cap Fund": 113177,
+            "quant Multi Cap Fund": 100631,
+            "Kotak Small Cap Fund": 102875,
+        }
+        st.markdown('<div class="section-header">Popular Funds — Search by name in sidebar</div>',
+                    unsafe_allow_html=True)
+        pcols = st.columns(4)
+        for i, (fname, code) in enumerate(pop.items()):
+            with pcols[i % 4]:
+                st.markdown(
+                    f'<div class="metric-card" style="border-left-color:{MFC["blue"]}">'
+                    f'<div class="metric-label">Code: {code}</div>'
+                    f'<div class="metric-value" style="font-size:12px;color:{MFC["blue"]}">{fname}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        return
+
+    # ── Fetch NAV ───────────────────────────────────────────────────────────────
+    with st.spinner(f"Fetching NAV history…"):
+        try:
+            mf_meta, mf_navs = _mf_fetch_nav(selected_code)
+        except Exception as e:
+            st.error(f"Failed to fetch NAV: {e}")
+            return
+
+    if mf_navs.empty:
+        st.error("No NAV data available for this fund.")
+        return
+
+    hist_ret   = _mf_hist_returns(mf_navs)
+    latest_nav = mf_navs["nav"].iloc[-1]
+    nav_start  = mf_navs["date"].iloc[0].date()
+    nav_end    = mf_navs["date"].iloc[-1].date()
+    nav_years  = (mf_navs["date"].iloc[-1] - mf_navs["date"].iloc[0]).days / 365.25
+
+    # ── Fund header strip ──────────────────────────────────────────────────────
+    fh1, fh2, fh3, fh4 = st.columns([4, 1.2, 1.2, 1.2])
+    with fh1:
+        st.markdown(f"### {selected_name}")
+        badges = []
+        for key, bg, fg in [
+            ("scheme_category", "#EBF5FB", "#1B5299"),
+            ("scheme_type",     "#EAFAF1", "#27AE60"),
+            ("fund_house",      "#FEF9E7", "#C8912A"),
+        ]:
+            v = mf_meta.get(key, "")
+            if v:
+                badges.append(
+                    f'<span style="display:inline-block;padding:3px 9px;border-radius:12px;'
+                    f'font-size:10px;font-weight:700;background:{bg};color:{fg};margin:2px;">'
+                    f'{v}</span>'
+                )
+        st.markdown(" ".join(badges), unsafe_allow_html=True)
+        st.caption(
+            f"Code: **{selected_code}** · Data: {nav_start.strftime('%d %b %Y')} → "
+            f"{nav_end.strftime('%d %b %Y')} ({nav_years:.1f} yrs, {len(mf_navs):,} records)"
+        )
+    with fh2:
+        nav_prev  = mf_navs["nav"].iloc[-2] if len(mf_navs) > 1 else latest_nav
+        nav_delta = latest_nav - nav_prev
+        st.metric("Latest NAV", f"₹{latest_nav:.4f}",
+                  delta=f"{nav_delta:+.4f} ({nav_delta/nav_prev*100:+.2f}%)")
+    with fh3:
+        if "1yr" in hist_ret:
+            st.metric("1yr Return", f"{hist_ret['1yr']:.2f}%")
+    with fh4:
+        if "3yr" in hist_ret:
+            st.metric("3yr CAGR", f"{hist_ret['3yr']:.2f}%")
+
+    # Historical CAGR strip
+    if hist_ret:
+        st.markdown('<div class="section-header">Historical CAGR Returns</div>',
+                    unsafe_allow_html=True)
+        rc = st.columns(len(hist_ret))
+        for col, (period, ret) in zip(rc, hist_ret.items()):
+            clr = MFC["green"] if ret >= 0 else MFC["red"]
+            with col:
+                st.markdown(
+                    f'<div class="metric-card" style="border-left-color:{clr};text-align:center;">'
+                    f'<div class="metric-label">{period} CAGR</div>'
+                    f'<div class="metric-value" style="color:{clr}">{ret:.2f}%</div>'
+                    f'<div class="metric-sub">annualised</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.divider()
+
+    # ══ HISTORICAL BACKTEST ════════════════════════════════════════════════════
+    if "Historical" in mf_mode:
+        st.markdown('<div class="section-header">📅 Historical Backtest — Real NAV Data</div>',
+                    unsafe_allow_html=True)
+
+        if mf_inv_type == "Lumpsum":
+            res = _mf_lumpsum(mf_navs, mf_start, mf_amount)
+        else:
+            res = _mf_sip(mf_navs, mf_start, mf_amount, mf_end, mf_stepup)
+
+        if res is None:
+            st.error("No NAV data from the selected start date. Try a later date.")
+            return
+
+        invested_ = res["invested"]
+        end_val_  = res["end_value"]
+        abs_ret_  = res["abs_return"]
+        abs_pct_  = res["abs_pct"]
+        years_    = res["years"]
+        s_date_   = res["start_date"]
+        e_date_   = res.get("end_date", nav_end)
+        cagr_val_ = res["cagr"] if mf_inv_type == "Lumpsum" else res["cagr_approx"]
+        gain_clr  = MFC["green"] if abs_ret_ >= 0 else MFC["red"]
+
+        sub_lbl = (f"₹{mf_amount:,} one-time · {s_date_} → {e_date_}"
+                   if mf_inv_type == "Lumpsum"
+                   else f"₹{mf_amount:,}/mo × {res['installments']} instalments · {s_date_} → {e_date_}")
+
+        # KPI cards
+        kp = st.columns(5)
+        kpis_ = [
+            ("Invested",        fmt_inr(invested_),    sub_lbl[:40],                    MFC["blue"]),
+            ("Current Value",   fmt_inr(end_val_),     f"As of {e_date_.strftime('%d %b %Y')}", MFC["teal"]),
+            ("Absolute Return", fmt_inr(abs(abs_ret_)), f"{abs_pct_:+.2f}%",            gain_clr),
+            ("CAGR (Est.)",     f"{cagr_val_:.2f}%",   "Compound annual growth rate",   MFC["purple"]),
+            ("Duration",        f"{years_:.1f} yrs",   f"{int(years_*12)} months",      MFC["gold"]),
+        ]
+        for col, (lbl, val, sub, clr) in zip(kp, kpis_):
+            with col:
+                st.markdown(_mf_card(lbl, val, sub, clr), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Charts ────────────────────────────────────────────────────────────
+        if mf_inv_type == "Lumpsum":
+            pf   = res["period_df"]
+            fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig1.add_trace(go.Scatter(
+                x=mf_navs["date"], y=mf_navs["nav"], name="NAV (full)",
+                line=dict(color=COLORS["gray"], width=1), opacity=0.3,
+            ), secondary_y=False)
+            fig1.add_trace(go.Scatter(
+                x=pf["date"], y=pf["nav"], name="NAV (period)",
+                line=dict(color=MFC["blue"], width=2),
+            ), secondary_y=False)
+            fig1.add_trace(go.Scatter(
+                x=pf["date"], y=pf["portfolio_value"], name="Portfolio Value",
+                line=dict(color=MFC["green"], width=2.5),
+                fill="tozeroy", fillcolor="rgba(39,174,96,0.08)",
+            ), secondary_y=True)
+            fig1.add_trace(go.Scatter(
+                x=pf["date"], y=pf["invested"], name="Invested",
+                line=dict(color=MFC["orange"], width=1.5, dash="dash"),
+            ), secondary_y=True)
+            fig1.add_vline(x=str(s_date_), line_dash="dot", line_color=MFC["gold"])
+            fig1.add_annotation(x=str(s_date_), text=f"Buy {fmt_inr(mf_amount)}",
+                                font=dict(size=10, color=MFC["gold"]),
+                                showarrow=False, xanchor="left", yref="paper", y=0.98)
+            fig1.update_layout(
+                title=dict(text=f"NAV & Portfolio Growth · {selected_name[:55]}", font_size=13),
+                height=380, hovermode="x unified",
+                legend=dict(orientation="h", y=1.08, x=0, font_size=10),
+                plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(t=60, b=40, l=50, r=50),
+            )
+            fig1.update_yaxes(title_text="NAV (₹)", secondary_y=False, showgrid=True, gridcolor="#ECF0F1")
+            fig1.update_yaxes(title_text="Portfolio Value (₹)", secondary_y=True)
+            st.plotly_chart(fig1, use_container_width=True)
+        else:
+            fp   = res["full_period"]
+            sipd = res["sip_df"]
+            fig1 = make_subplots(rows=1, cols=2, horizontal_spacing=0.08,
+                                 subplot_titles=("Portfolio Value vs Invested", "Units Accumulated"))
+            fig1.add_trace(go.Scatter(x=fp["date"], y=fp["portfolio_value"],
+                                      name="Portfolio Value",
+                                      line=dict(color=MFC["green"], width=2.5),
+                                      fill="tozeroy", fillcolor="rgba(39,174,96,0.10)"), row=1, col=1)
+            fig1.add_trace(go.Scatter(x=fp["date"], y=fp["cum_invested"],
+                                      name="Amount Invested",
+                                      line=dict(color=MFC["orange"], width=1.5, dash="dash")), row=1, col=1)
+            fig1.add_trace(go.Scatter(x=sipd["date"], y=sipd["cum_units"],
+                                      name="Cumulative Units",
+                                      line=dict(color=MFC["purple"], width=2),
+                                      fill="tozeroy", fillcolor="rgba(142,68,173,0.10)"), row=1, col=2)
+            fig1.update_layout(height=380, hovermode="x unified",
+                               legend=dict(orientation="h", y=1.1, x=0, font_size=10),
+                               plot_bgcolor="white", paper_bgcolor="white",
+                               margin=dict(t=60, b=40, l=50, r=50))
+            st.plotly_chart(fig1, use_container_width=True)
+
+        # ── Donut + Monthly returns ────────────────────────────────────────────
+        dc1, dc2 = st.columns([1, 2])
+        with dc1:
+            st.markdown('<div class="section-header">Return Breakdown</div>',
+                        unsafe_allow_html=True)
+            donut = go.Figure(go.Pie(
+                labels=["Invested", "Gains" if abs_ret_ >= 0 else "Loss"],
+                values=[invested_, max(abs_ret_, 0)],
+                hole=0.55,
+                marker_colors=[MFC["blue"], MFC["green"] if abs_ret_ >= 0 else MFC["red"]],
+                textinfo="label+percent", textfont_size=11,
+            ))
+            donut.update_layout(
+                height=280, margin=dict(t=20, b=20, l=10, r=10),
+                showlegend=False, paper_bgcolor="white",
+                annotations=[dict(text=f"<b>{fmt_inr(end_val_)}</b><br>Total",
+                                  x=0.5, y=0.5, showarrow=False, font_size=11)],
+            )
+            st.plotly_chart(donut, use_container_width=True)
+
+        with dc2:
+            st.markdown('<div class="section-header">Monthly NAV Returns (Period)</div>',
+                        unsafe_allow_html=True)
+            src = res["period_df"] if mf_inv_type == "Lumpsum" else res["full_period"]
+            nav_monthly = src.set_index("date").resample("M")["nav"].last()
+            nav_m_ret   = nav_monthly.pct_change().dropna() * 100
+            bar_fig = go.Figure(go.Bar(
+                x=nav_m_ret.index, y=nav_m_ret.values,
+                marker_color=[MFC["green"] if v >= 0 else MFC["red"] for v in nav_m_ret],
+            ))
+            bar_fig.add_hline(y=0, line_color=COLORS["gray"], line_width=0.8)
+            bar_fig.update_layout(height=280, plot_bgcolor="white", paper_bgcolor="white",
+                                  margin=dict(t=10, b=30, l=40, r=20),
+                                  yaxis=dict(title="Return %", gridcolor="#ECF0F1"),
+                                  xaxis=dict(showgrid=False))
+            st.plotly_chart(bar_fig, use_container_width=True)
+
+        # ── NAV statistics row ─────────────────────────────────────────────────
+        st.markdown('<div class="section-header">NAV Statistics (Investment Period)</div>',
+                    unsafe_allow_html=True)
+        pnav = res["period_df"]["nav"] if mf_inv_type == "Lumpsum" else res["full_period"]["nav"]
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        nav_stats = [
+            ("NAV at Entry",  f"₹{res['start_nav']:.4f}",  MFC["blue"]),
+            ("NAV Today",     f"₹{res['end_nav']:.4f}",    MFC["teal"]),
+            ("Period High",   f"₹{pnav.max():.4f}",        MFC["green"]),
+            ("Period Low",    f"₹{pnav.min():.4f}",        MFC["red"]),
+            ("Std Dev (NAV)", f"₹{pnav.std():.4f}",        MFC["purple"]),
+            ("Monthly Vol",   f"{nav_m_ret.std():.2f}%",   MFC["orange"]),
+        ]
+        for col, (lbl, val, clr) in zip([s1, s2, s3, s4, s5, s6], nav_stats):
+            with col:
+                st.markdown(
+                    f'<div class="metric-card" style="border-left-color:{clr}">'
+                    f'<div class="metric-label">{lbl}</div>'
+                    f'<div class="metric-value" style="color:{clr};font-size:15px">{val}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if mf_inv_type == "SIP (Monthly)":
+            with st.expander("📋 SIP Instalment Details", expanded=False):
+                sd = res["sip_df"].copy()
+                sd["date"]          = sd["date"].dt.strftime("%d %b %Y")
+                sd["nav"]           = sd["nav"].apply(lambda x: f"₹{x:.4f}")
+                sd["units_bought"]  = sd["units_bought"].apply(lambda x: f"{x:.4f}")
+                sd["cum_units"]     = sd["cum_units"].apply(lambda x: f"{x:.4f}")
+                sd["sip_amount"]    = sd["sip_amount"].apply(fmt_inr)
+                sd["cum_invested"]  = sd["cum_invested"].apply(fmt_inr)
+                sd.columns = ["Date", "NAV", "Units Bought", "Cum. Units",
+                              "SIP Amount", "Cum. Invested"]
+                st.dataframe(sd, use_container_width=True, hide_index=True)
+
+    # ══ FUTURE PROJECTION ══════════════════════════════════════════════════════
+    else:
+        st.markdown('<div class="section-header">🔮 Future Projection — Return Simulator</div>',
+                    unsafe_allow_html=True)
+
+        # Return rate picker (shown in sidebar continuation)
+        with st.sidebar:
+            st.markdown("### 📈 Return Rate")
+            rate_opts = {f"{k} CAGR ({v:.2f}%)": v for k, v in hist_ret.items()}
+            rate_opts["Custom %"] = None
+            rate_lbl = st.selectbox("Use rate from", list(rate_opts.keys()), key="mf_rate_lbl")
+            if rate_opts[rate_lbl] is None:
+                base_rate = float(st.number_input("Custom %", min_value=0.1, max_value=50.0,
+                                                  value=12.0, step=0.5, key="mf_custom_rate"))
+            else:
+                base_rate = rate_opts[rate_lbl]
+            st.caption(f"Base rate: **{base_rate:.2f}% p.a.**")
+
+        bear_rate = max(base_rate * 0.55, 1.0)
+        bull_rate = base_rate * 1.45
+        inv_lbl   = "Lumpsum" if mf_inv_type == "Lumpsum" else "SIP (Monthly)"
+
+        bear_df = _mf_project_future(mf_amount, inv_lbl, bear_rate, mf_proj_years, mf_stepup)
+        base_df = _mf_project_future(mf_amount, inv_lbl, base_rate, mf_proj_years, mf_stepup)
+        bull_df = _mf_project_future(mf_amount, inv_lbl, bull_rate, mf_proj_years, mf_stepup)
+
+        invested_f = base_df["invested"].iloc[-1]
+        end_bear   = bear_df["value"].iloc[-1]
+        end_base   = base_df["value"].iloc[-1]
+        end_bull   = bull_df["value"].iloc[-1]
+        infl_adj   = end_base / ((1 + mf_inflation / 100) ** mf_proj_years)
+
+        # KPI cards
+        kp2 = st.columns(5)
+        kpis2 = [
+            ("Total Invested",   fmt_inr(invested_f),
+             f"{mf_proj_years} yrs · {inv_lbl}", MFC["blue"]),
+            ("Bear Case",        fmt_inr(end_bear),
+             f"{bear_rate:.1f}% p.a. · gain: {fmt_inr(end_bear - invested_f)}", MFC["orange"]),
+            ("Base Case",        fmt_inr(end_base),
+             f"{base_rate:.1f}% p.a. · gain: {fmt_inr(end_base - invested_f)}", MFC["green"]),
+            ("Bull Case",        fmt_inr(end_bull),
+             f"{bull_rate:.1f}% p.a. · gain: {fmt_inr(end_bull - invested_f)}", MFC["purple"]),
+            ("Inflation-Adj.",   fmt_inr(infl_adj),
+             f"@ {mf_inflation}% inflation over {mf_proj_years}y", MFC["gold"]),
+        ]
+        for col, (lbl, val, sub, clr) in zip(kp2, kpis2):
+            with col:
+                st.markdown(_mf_card(lbl, val, sub, clr), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Growth chart
+        x_vals = base_df["year"]
+        fig_p  = go.Figure()
+        fig_p.add_trace(go.Scatter(
+            x=list(x_vals) + list(x_vals[::-1]),
+            y=list(bull_df["value"]) + list(bear_df["value"][::-1]),
+            fill="toself", fillcolor="rgba(39,174,96,0.08)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Bear–Bull Range", hoverinfo="skip",
+        ))
+        fig_p.add_trace(go.Scatter(x=x_vals, y=bear_df["value"],
+                                   name=f"Bear ({bear_rate:.1f}%)",
+                                   line=dict(color=MFC["orange"], width=1.5, dash="dot")))
+        fig_p.add_trace(go.Scatter(x=x_vals, y=base_df["value"],
+                                   name=f"Base ({base_rate:.1f}%)",
+                                   line=dict(color=MFC["green"], width=2.5)))
+        fig_p.add_trace(go.Scatter(x=x_vals, y=bull_df["value"],
+                                   name=f"Bull ({bull_rate:.1f}%)",
+                                   line=dict(color=MFC["purple"], width=1.5, dash="dash")))
+        fig_p.add_trace(go.Scatter(x=x_vals, y=base_df["invested"],
+                                   name="Invested Capital",
+                                   line=dict(color=MFC["blue"], width=2, dash="dashdot")))
+        infl_line = [end_base / ((1 + mf_inflation / 100) ** (mf_proj_years - yr)) for yr in x_vals]
+        fig_p.add_trace(go.Scatter(x=x_vals, y=infl_line,
+                                   name=f"Infl-adj ({mf_inflation}%)",
+                                   line=dict(color=MFC["gray"], width=1, dash="dot"), opacity=0.6))
+        fig_p.update_layout(
+            title=dict(text=f"Projected Growth · {mf_proj_years}yr · {inv_lbl} · {selected_name[:50]}",
+                       font_size=13),
+            height=420, hovermode="x unified",
+            xaxis=dict(title="Years", showgrid=False),
+            yaxis=dict(title="Value (₹)", showgrid=True, gridcolor="#ECF0F1"),
+            legend=dict(orientation="h", y=1.08, x=0, font_size=10),
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=60, b=40, l=60, r=30),
+        )
+        st.plotly_chart(fig_p, use_container_width=True)
+
+        # Donut + Milestone table
+        mc1, mc2 = st.columns([1, 2])
+        with mc1:
+            st.markdown('<div class="section-header">Invested vs Gains (Base)</div>',
+                        unsafe_allow_html=True)
+            base_gains = end_base - invested_f
+            d2 = go.Figure(go.Pie(
+                labels=["Invested", "Estimated Gains"],
+                values=[invested_f, max(base_gains, 0)],
+                hole=0.55,
+                marker_colors=[MFC["blue"], MFC["green"]],
+                textinfo="label+percent", textfont_size=11,
+            ))
+            d2.update_layout(
+                height=300, margin=dict(t=20, b=20, l=10, r=10),
+                showlegend=False, paper_bgcolor="white",
+                annotations=[dict(text=f"<b>{fmt_inr(end_base)}</b><br>@ {base_rate:.1f}%",
+                                  x=0.5, y=0.5, showarrow=False, font_size=11)],
+            )
+            st.plotly_chart(d2, use_container_width=True)
+        with mc2:
+            st.markdown('<div class="section-header">Year-by-Year Milestones (Base Case)</div>',
+                        unsafe_allow_html=True)
+            milestones = []
+            for yr in range(1, mf_proj_years + 1):
+                rb = bear_df[bear_df["month"] == yr * 12].iloc[0]
+                rm = base_df[base_df["month"] == yr * 12].iloc[0]
+                ru = bull_df[bull_df["month"] == yr * 12].iloc[0]
+                milestones.append({
+                    "Year":                     yr,
+                    "Invested":                 fmt_inr(rm["invested"]),
+                    f"Bear ({bear_rate:.1f}%)": fmt_inr(rb["value"]),
+                    f"Base ({base_rate:.1f}%)": fmt_inr(rm["value"]),
+                    f"Bull ({bull_rate:.1f}%)": fmt_inr(ru["value"]),
+                    "Gain % (Base)":            f"{rm['gain_pct']:.1f}%" if pd.notna(rm["gain_pct"]) else "—",
+                })
+            st.dataframe(pd.DataFrame(milestones), use_container_width=True, hide_index=True)
+
+        # Scenario comparison using all historical CAGRs
+        if hist_ret:
+            st.markdown('<div class="section-header">Scenario Comparison — All Historical CAGRs</div>',
+                        unsafe_allow_html=True)
+            cmp_rows = []
+            for period, rate in hist_ret.items():
+                df_tmp  = _mf_project_future(mf_amount, inv_lbl, rate, mf_proj_years, mf_stepup)
+                end_tmp = df_tmp["value"].iloc[-1]
+                inv_tmp = df_tmp["invested"].iloc[-1]
+                cmp_rows.append({
+                    "Period Used":     period,
+                    "CAGR":            f"{rate:.2f}%",
+                    "Invested":        fmt_inr(inv_tmp),
+                    "Projected Value": fmt_inr(end_tmp),
+                    "Total Gain":      fmt_inr(end_tmp - inv_tmp),
+                    "Return %":        f"{(end_tmp - inv_tmp) / inv_tmp * 100:.1f}%",
+                    "Infl-adj":        fmt_inr(end_tmp / ((1 + mf_inflation / 100) ** mf_proj_years)),
+                })
+            st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
+
+        st.markdown(
+            f'<div style="background:#EBF5FB;border-left:4px solid #1B5299;border-radius:6px;'
+            f'padding:10px 14px;font-size:11px;color:#1A2E4A;margin-top:10px;">'
+            f'<b>Disclaimer:</b> Projections are estimates based on historical CAGR from live NAV data. '
+            f'Mutual fund returns are subject to market risk. Past performance is not indicative of future results. '
+            f'Bear/Bull at {bear_rate:.1f}% / {bull_rate:.1f}% (55%/145% of base).</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Full NAV history chart ─────────────────────────────────────────────────
+    with st.expander("📈 Full NAV History Chart", expanded=False):
+        fig_full = go.Figure()
+        fig_full.add_trace(go.Scatter(
+            x=mf_navs["date"], y=mf_navs["nav"],
+            line=dict(color=MFC["blue"], width=1.5),
+            fill="tozeroy", fillcolor="rgba(27,82,153,0.07)",
+        ))
+        fig_full.update_layout(
+            title=f"Full NAV History · {selected_name[:60]}",
+            height=350, hovermode="x",
+            xaxis=dict(showgrid=False, rangeslider=dict(visible=True)),
+            yaxis=dict(title="NAV (₹)", showgrid=True, gridcolor="#ECF0F1"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=50, b=40, l=60, r=20),
+        )
+        st.plotly_chart(fig_full, use_container_width=True)
+
+    with st.expander("📋 Raw NAV Data (last 90 days)", expanded=False):
+        tail = mf_navs.tail(90).copy()
+        tail["date"] = tail["date"].dt.strftime("%d %b %Y")
+        tail["nav"]  = tail["nav"].apply(lambda x: f"₹{x:.4f}")
+        tail.columns = ["Date", "NAV"]
+        st.dataframe(tail[::-1], use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"Data: [mfapi.in](https://www.mfapi.in) — free open NAV API · "
+        f"Cache: 5 min · {TODAY.strftime('%d %b %Y')}"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown(f"""
+    # ── App header + page navigation ──────────────────────────────────────────
+    st.markdown("""
     <div style="background:#1A2E4A;padding:14px 16px;border-radius:8px;margin-bottom:10px;">
       <div style="color:#C8912A;font-size:10px;font-weight:700;letter-spacing:1px;">
-        EDUCATION LOAN
+        PERSONAL FINANCE
       </div>
-      <div style="color:white;font-size:13px;font-weight:600;margin-top:4px;">{BANK}</div>
-      <div style="color:#BDC3C7;font-size:11px;">Acct: {MASKED_ACCT}</div>
-      <div style="color:#C8912A;font-size:12px;margin-top:5px;">
-        Rate: {RATE_PA*100:.2f}% p.a.
+      <div style="color:white;font-size:13px;font-weight:600;margin-top:4px;">
+        Analytics Dashboard
       </div>
     </div>
     """, unsafe_allow_html=True)
 
+    st.selectbox(
+        "Navigate to",
+        ["🏦 Loan Dashboard", "📊 Mutual Funds"],
+        key="current_page",
+        label_visibility="collapsed",
+    )
+
     st.caption(f"**{TODAY.strftime('%d %b %Y')}**  ·  "
                f"User: **{st.session_state.get('username', '')}**")
-
     if st.button("🚪 Logout", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
 
     st.divider()
 
-    # ── Monthly EMI slider ────────────────────────────────────────────────────
-    st.markdown("### ⚙️ Monthly EMI")
-    monthly_pmt = st.slider(
-        "Monthly Payment (₹)",
-        min_value=10_000, max_value=2_00_000,
-        value=st.session_state.default_emi,
-        step=5_000, format="₹%d",
-        key="emi_slider",
-    )
-    st.session_state.default_emi = monthly_pmt
-    delta_color = "normal" if monthly_pmt > breakeven else "inverse"
-    st.metric(
-        "Monthly Breakeven",
-        fmt_inr(breakeven),
-        delta=f"{'surplus' if monthly_pmt > breakeven else 'deficit'}: "
-              f"{fmt_inr(abs(monthly_pmt - breakeven))}",
-        delta_color=delta_color,
-    )
+    if _on_loan_page:
+        st.markdown(f"""
+        <div style="background:#1B5299;padding:10px 14px;border-radius:8px;margin-bottom:10px;">
+          <div style="color:#C8912A;font-size:10px;font-weight:700;letter-spacing:1px;">
+            EDUCATION LOAN
+          </div>
+          <div style="color:white;font-size:12px;font-weight:600;margin-top:3px;">{BANK}</div>
+          <div style="color:#BDC3C7;font-size:11px;">Acct: {MASKED_ACCT}
+          &nbsp;·&nbsp; {RATE_PA*100:.2f}% p.a.</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.divider()
+    if _on_loan_page:
+        # ── Monthly EMI slider ────────────────────────────────────────────────────
+        st.markdown("### ⚙️ Monthly EMI")
+        monthly_pmt = st.slider(
+            "Monthly Payment (₹)",
+            min_value=10_000, max_value=2_00_000,
+            value=st.session_state.default_emi,
+            step=5_000, format="₹%d",
+            key="emi_slider",
+        )
+        st.session_state.default_emi = monthly_pmt
+        delta_color = "normal" if monthly_pmt > breakeven else "inverse"
+        st.metric(
+            "Monthly Breakeven",
+            fmt_inr(breakeven),
+            delta=f"{'surplus' if monthly_pmt > breakeven else 'deficit'}: "
+                  f"{fmt_inr(abs(monthly_pmt - breakeven))}",
+            delta_color=delta_color,
+        )
 
-    # ── Add Manual Payment ────────────────────────────────────────────────────
-    st.markdown("### ➕ Add / Update Payment")
-    with st.form("add_payment_form", clear_on_submit=True):
-        pay_date   = st.date_input("Payment Date", value=TODAY,
-                                   min_value=date(2020, 1, 1), max_value=TODAY)
-        pay_amount = st.number_input("Amount (₹)", min_value=500,
-                                     max_value=50_00_000, value=20_000, step=500)
-        pay_remark = st.text_input("Remarks", placeholder="e.g. Extra EMI, NEFT")
-        if st.form_submit_button("💾 Save Payment", use_container_width=True):
-            save_manual_payment(pay_date, pay_amount,
-                                pay_remark or "Manual Payment")
-            st.session_state.manual_version += 1
-            st.cache_data.clear()
-            st.success(f"Saved {fmt_inr(pay_amount)} on {pay_date}")
-            st.rerun()
+        st.divider()
 
-    manual_list = load_manual_payments()
-    if manual_list:
-        st.markdown(f"**{len(manual_list)} manual entry(s):**")
-        for i, p in enumerate(manual_list):
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.caption(f"{p['date']}: **{fmt_inr(p['amount'])}**  \n"
-                           f"_{p.get('remarks','')[:28]}_")
-            with c2:
-                if st.button("✕", key=f"del_{i}", help="Delete this entry"):
-                    delete_manual_payment(i)
-                    st.session_state.manual_version += 1
-                    st.cache_data.clear()
-                    st.rerun()
-    else:
-        st.caption("No manual payments yet.")
+        # ── Add Manual Payment ────────────────────────────────────────────────────
+        st.markdown("### ➕ Add / Update Payment")
+        with st.form("add_payment_form", clear_on_submit=True):
+            pay_date   = st.date_input("Payment Date", value=TODAY,
+                                       min_value=date(2020, 1, 1), max_value=TODAY)
+            pay_amount = st.number_input("Amount (₹)", min_value=500,
+                                         max_value=50_00_000, value=20_000, step=500)
+            pay_remark = st.text_input("Remarks", placeholder="e.g. Extra EMI, NEFT")
+            if st.form_submit_button("💾 Save Payment", use_container_width=True):
+                save_manual_payment(pay_date, pay_amount,
+                                    pay_remark or "Manual Payment")
+                st.session_state.manual_version += 1
+                st.cache_data.clear()
+                st.success(f"Saved {fmt_inr(pay_amount)} on {pay_date}")
+                st.rerun()
 
-    st.divider()
+        manual_list = load_manual_payments()
+        if manual_list:
+            st.markdown(f"**{len(manual_list)} manual entry(s):**")
+            for i, p in enumerate(manual_list):
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.caption(f"{p['date']}: **{fmt_inr(p['amount'])}**  \n"
+                               f"_{p.get('remarks','')[:28]}_")
+                with c2:
+                    if st.button("✕", key=f"del_{i}", help="Delete this entry"):
+                        delete_manual_payment(i)
+                        st.session_state.manual_version += 1
+                        st.cache_data.clear()
+                        st.rerun()
+        else:
+            st.caption("No manual payments yet.")
 
-    # ── Date Range Filter ─────────────────────────────────────────────────────
-    st.markdown("### 📅 Date Range")
-    min_date   = disb["Date"].min().date()
-    date_range = st.date_input(
-        "Filter charts from",
-        value=(min_date, TODAY),
-        min_value=min_date, max_value=TODAY,
-    )
-    filter_start = pd.Timestamp(date_range[0]) if len(date_range) >= 1 else pd.Timestamp(min_date)
-    filter_end   = pd.Timestamp(date_range[1]) if len(date_range) == 2 else pd.Timestamp(TODAY)
+        st.divider()
 
-    st.divider()
-    auto_refresh = st.toggle("Auto-refresh (5 min)", value=False)
-    if auto_refresh:
-        st.caption("Page will refresh every 5 minutes")
+        # ── Date Range Filter ─────────────────────────────────────────────────────
+        st.markdown("### 📅 Date Range")
+        min_date   = disb["Date"].min().date()
+        date_range = st.date_input(
+            "Filter charts from",
+            value=(min_date, TODAY),
+            min_value=min_date, max_value=TODAY,
+        )
+        filter_start = pd.Timestamp(date_range[0]) if len(date_range) >= 1 else pd.Timestamp(min_date)
+        filter_end   = pd.Timestamp(date_range[1]) if len(date_range) == 2 else pd.Timestamp(TODAY)
+
+        st.divider()
+        auto_refresh = st.toggle("Auto-refresh (5 min)", value=False)
+        if auto_refresh:
+            st.caption("Page will refresh every 5 minutes")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HEADER
+#  PAGE ROUTER — render MF page and stop; loan content falls through below
+# ─────────────────────────────────────────────────────────────────────────────
+if not _on_loan_page:
+    render_mf_page()
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HEADER  (Loan Dashboard)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="background:linear-gradient(135deg,#1A2E4A 0%,#1B5299 100%);
@@ -1504,6 +2298,6 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 #  AUTO-REFRESH
 # ─────────────────────────────────────────────────────────────────────────────
-if auto_refresh:
+if _on_loan_page and auto_refresh:
     time.sleep(300)
     st.rerun()
